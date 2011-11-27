@@ -1,0 +1,184 @@
+diff --git a/build.xml b/build.xml
+index 2183c86..7de9222 100644
+--- a/build.xml
++++ b/build.xml
+@@ -297,7 +297,7 @@
+ 
+       <manifest>
+         <attribute name="Main-Class"
+-                   value="com.google.javascript.jscomp.CommandLineRunner" />
++                   value="com.google.javascript.jscomp.BaiduCommandLineRunner" />
+       </manifest>
+     </jar>
+   </target>
+diff --git a/src/com/google/javascript/jscomp/BaiduCommandLineRunner.java b/src/com/google/javascript/jscomp/BaiduCommandLineRunner.java
+new file mode 100644
+index 0000000..0c64bf5
+--- /dev/null
++++ b/src/com/google/javascript/jscomp/BaiduCommandLineRunner.java
+@@ -0,0 +1,47 @@
++package com.google.javascript.jscomp;
++
++import com.google.javascript.rhino.jstype.FunctionType;
++
++class BaiduCodingConvetion extends ClosureCodingConvention {
++
++  private static final long serialVersionUID = -4227037437967437070L;
++
++  @Override
++  public boolean isSuperClassReference(String propertyName) {
++    return "superClass".equals(propertyName);
++  }
++
++  @Override
++  public void applySubclassRelationship(FunctionType parentCtor,
++      FunctionType childCtor, SubclassType type) {
++    if (type == SubclassType.INHERITS) {
++      childCtor.defineDeclaredProperty("superClass", parentCtor.getPrototype(),
++          childCtor.getSource());
++      childCtor.getPrototype().defineDeclaredProperty("constructor", childCtor,
++          childCtor.getSource());
++    }
++  }
++}
++
++public class BaiduCommandLineRunner extends CommandLineRunner {
++
++  protected BaiduCommandLineRunner(String[] args) {
++    super(args);
++    getCommandLineConfig().setCodingConvention(new BaiduCodingConvetion());
++  }
++
++  protected CompilerOptions createOptions() {
++    CompilerOptions options = super.createOptions();
++    options.setCodingConvention(new BaiduCodingConvetion());
++    return options;
++  }
++
++  public static void main(String[] args) {
++    BaiduCommandLineRunner runner = new BaiduCommandLineRunner(args);
++    if (runner.shouldRunCompiler()) {
++      runner.run();
++    } else {
++      System.exit(-1);
++    }
++  }
++}
+diff --git a/src/com/google/javascript/jscomp/CommandLineRunner.java b/src/com/google/javascript/jscomp/CommandLineRunner.java
+index c634fea..d21fefc 100644
+--- a/src/com/google/javascript/jscomp/CommandLineRunner.java
++++ b/src/com/google/javascript/jscomp/CommandLineRunner.java
+@@ -272,7 +272,7 @@ public class CommandLineRunner extends
+ 
+     @Option(name = "--compilation_level",
+         usage = "Specifies the compilation level to use. Options: " +
+-        "WHITESPACE_ONLY, SIMPLE_OPTIMIZATIONS, ADVANCED_OPTIMIZATIONS")
++        "WHITESPACE_ONLY, SIMPLE_OPTIMIZATIONS, BAIDU_OPTIMIZATIONS, ADVANCED_OPTIMIZATIONS")
+     private CompilationLevel compilation_level =
+         CompilationLevel.SIMPLE_OPTIMIZATIONS;
+ 
+diff --git a/src/com/google/javascript/jscomp/CompilationLevel.java b/src/com/google/javascript/jscomp/CompilationLevel.java
+index 1a90ec7..9c7a441 100644
+--- a/src/com/google/javascript/jscomp/CompilationLevel.java
++++ b/src/com/google/javascript/jscomp/CompilationLevel.java
+@@ -42,6 +42,12 @@ public enum CompilationLevel {
+   SIMPLE_OPTIMIZATIONS,
+ 
+   /**
++   * 我们自己定义的一些优化阶段，在SIMPLE模式上面进行了一些增强，比如
++   * 可以删除一些Dead Code，可以删除goog.include的调用等等 
++   */
++  BAIDU_OPTIMIZATIONS,
++  
++  /**
+    * ADVANCED_OPTIMIZATIONS aggressively reduces code size by renaming function
+    * names and variables, removing code which is never called, etc.
+    */
+@@ -58,6 +64,9 @@ public enum CompilationLevel {
+       case SIMPLE_OPTIMIZATIONS:
+         applySafeCompilationOptions(options);
+         break;
++      case BAIDU_OPTIMIZATIONS:
++        applyBaiduCompilationOptions(options);
++        break;
+       case ADVANCED_OPTIMIZATIONS:
+         applyFullCompilationOptions(options);
+         break;
+@@ -121,6 +130,24 @@ public enum CompilationLevel {
+     options.setWarningLevel(DiagnosticGroups.NON_STANDARD_JSDOC,
+         CheckLevel.OFF);
+   }
++  
++  private static void applyBaiduCompilationOptions(CompilerOptions options) {
++    applySafeCompilationOptions(options);
++    
++    options.smartNameRemoval = true;
++    options.reserveRawExports = true;
++    options.extractPrototypeMemberDeclarations = true;
++    options.collapseAnonymousFunctions = true;
++
++    options.inlineConstantVars = true;
++    options.setInlineFunctions(Reach.ALL);
++    options.inlineGetters = true;
++    options.setInlineVariables(Reach.ALL);
++    options.flowSensitiveInlineVariables = true;
++    options.computeFunctionSideEffects = true;
++    
++    options.setRemoveUnusedVariable(Reach.ALL);
++  }
+ 
+   /**
+    * Add the options that will work only if the user exported all the symbols
+diff --git a/src/com/google/javascript/jscomp/ProcessClosurePrimitives.java b/src/com/google/javascript/jscomp/ProcessClosurePrimitives.java
+index 48e53a1..213b08c 100644
+--- a/src/com/google/javascript/jscomp/ProcessClosurePrimitives.java
++++ b/src/com/google/javascript/jscomp/ProcessClosurePrimitives.java
+@@ -195,6 +195,8 @@ class ProcessClosurePrimitives extends AbstractPostOrderCallback
+               processRequireCall(t, n, parent);
+             } else if ("provide".equals(methodName)) {
+               processProvideCall(t, n, parent);
++            } else if ("include".equals(methodName)) {
++              processIncludeCall(t, n, parent);
+             } else if ("exportSymbol".equals(methodName)) {
+               Node arg = left.getNext();
+               if (arg.isString()) {
+@@ -311,6 +313,14 @@ class ProcessClosurePrimitives extends AbstractPostOrderCallback
+   }
+ 
+   /**
++   * Handles a goog.include call.
++   */
++  private void processIncludeCall(NodeTraversal t, Node n, Node parent) {
++    parent.detachFromParent();
++    compiler.reportCodeChange();
++  }
++  
++  /**
+    * Handles a goog.provide call.
+    */
+   private void processProvideCall(NodeTraversal t, Node n, Node parent) {
+diff --git a/test/com/google/javascript/jscomp/ProcessClosurePrimitivesTest.java b/test/com/google/javascript/jscomp/ProcessClosurePrimitivesTest.java
+index 26a18db..ac32d46 100644
+--- a/test/com/google/javascript/jscomp/ProcessClosurePrimitivesTest.java
++++ b/test/com/google/javascript/jscomp/ProcessClosurePrimitivesTest.java
+@@ -110,6 +110,20 @@ public class ProcessClosurePrimitivesTest extends CompilerTestCase {
+     return 1;
+   }
+ 
++  public void testRemovalOfIncludeCall() {
++    test("goog.include('css/a.css');", "");
++    test("goog.include('css/a.css');goog.include('css/a.css');goog.provide('foo');",
++            "var foo={};");
++       test("goog.include('css/a.css');goog.include('css/a.css');goog.provide('foo.bar');",
++            "var foo={}; foo.bar={};");
++       test("goog.include('css/a.css');goog.include('css/a.css');goog.provide('foo.bar.baz');",
++            "var foo={}; foo.bar={}; foo.bar.baz={};");
++       test("goog.include('css/a.css');goog.include('css/a.css');goog.provide('foo.bar.baz.boo');",
++            "var foo={}; foo.bar={}; foo.bar.baz={}; foo.bar.baz.boo={};");
++       test("goog.include('css/a.css');goog.include('css/a.css');goog.provide('goog.bar');",
++            "goog.bar={};");  // goog is special-cased
++  }
++  
+   public void testSimpleProvides() {
+     test("goog.provide('foo');",
+          "var foo={};");
